@@ -293,17 +293,40 @@ def update_analysis(img_base64, threshold, relayoutData):
 
     # Determine the ROI from relayoutData (the user's drag selection)
     roi_data = None
-    if relayoutData and 'xaxis.range[0]' in relayoutData:
-        # This handles a box selection from the main graph
-        roi_data = {'range': {k: relayoutData[k] for k in relayoutData if 'range' in k}}
+    roi_info_text = "ROI: Full Image"
+
+    # Check for a specific BOX SELECTION event (which is the most reliable way to get ROI data)
+    if relayoutData and 'xaxis.range' in relayoutData and 'yaxis.range' in relayoutData:
+        # 1. This means the user performed a box selection (dragmode='select')
+        #    The structure is correct: relayoutData={'xaxis.range': [x0, x1], 'yaxis.range': [y0, y1]}
         
-        # Also need to get range to display ROI info
         x_range = relayoutData['xaxis.range']
         y_range = relayoutData['yaxis.range']
-        roi_info_text = f"ROI: X[{int(x_range[0])}:{int(x_range[1])}], Y[{int(y_range[1])}:{int(y_range[0])}]"
-    else:
-        # No ROI selected, default to full image
-        roi_info_text = "ROI: Full Image"
+        
+        # Construct roi_data for the processing function
+        roi_data = {'range': {'xaxis.range': x_range, 'yaxis.range': y_range}}
+        
+        # Display info: Note that in Plotly's layout, y-axis is inverted (y1 to y0)
+        roi_info_text = f"ROI: X[{int(x_range[0]):,}:{int(x_range[1]):,}], Y[{int(y_range[1]):,}:{int(y_range[0]):,}]"
+        
+    elif relayoutData and any(key.endswith('.range[0]') for key in relayoutData):
+        # 2. This handles general panning or zooming events which change the range.
+        #    This is typically NOT a full ROI selection but a viewport change.
+        #    We must extract the full range from the keys provided.
+        #    If the user has zoomed/panned, use the new viewport as the ROI.
+        
+        # Find the updated range keys (xaxis.range, yaxis.range)
+        x_key = next((k for k in relayoutData if k.startswith('xaxis.range')), None)
+        y_key = next((k for k in relayoutData if k.startswith('yaxis.range')), None)
+        
+        if x_key and y_key:
+            x_range = relayoutData[x_key]
+            y_range = relayoutData[y_key]
+
+            # Construct roi_data for the processing function
+            roi_data = {'range': {'xaxis.range': x_range, 'yaxis.range': y_range}}
+            
+            roi_info_text = f"ROI: Zoom/Pan X[{int(x_range[0]):,}:{int(x_range[1]):,}], Y[{int(y_range[1]):,}:{int(y_range[0]):,}]"
 
     # --- Process and Get Results ---
     fig_processed, num_spots, total_roi_area, total_white_area, ratio_white_to_total = \
@@ -350,3 +373,4 @@ if __name__ == '__main__':
     
     print("Starting Dash server. Go to http://127.0.0.1:8050/")
     app.run_server(debug=True)
+

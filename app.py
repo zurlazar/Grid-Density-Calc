@@ -6,6 +6,10 @@ import numpy as np
 import cv2
 import math
 import os
+# Added imports for handling image uploads
+import base64
+from io import BytesIO
+from PIL import Image
 
 # --- 1. Global Initialization for Dash and Gunicorn ---
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CERULEAN])
@@ -13,17 +17,22 @@ server = app.server
 
 # --- 2. Data and Helper Functions ---
 
+def get_local_images():
+    """Scans the current directory for .jpg and .jpeg files and returns a list of filenames."""
+    image_files = []
+    try:
+        for filename in os.listdir('.'):
+            if filename.lower().endswith(('.jpg', '.jpeg')):
+                image_files.append(filename)
+    except Exception as e:
+        print(f"Error scanning directory for images: {e}")
+    return image_files
+
 def load_image_from_file(filename):
-    """
-    Loads an image directly from the local filesystem (must be in the same 
-    folder as app.py) into an RGB numpy array.
-    Returns RGB numpy array or None on failure.
-    """
+    """Loads a local image file (JPG/JPEG) into an RGB numpy array using OpenCV."""
     if not filename:
         return None
     
-    # In a local environment, this looks for the file in the script's directory.
-    # In the canvas environment, it looks relative to the execution context.
     try:
         # Read the image using OpenCV (loads as BGR)
         img_bgr = cv2.imread(filename)
@@ -35,21 +44,28 @@ def load_image_from_file(filename):
         return img_rgb
         
     except Exception as e:
-        print(f"Error loading image '{filename}': {e}")
+        print(f"Error loading local image '{filename}': {e}")
+        return None
+
+def parse_uploaded_contents(contents):
+    """Decodes the uploaded base64 image content into an RGB numpy array using PIL."""
+    if contents is None:
+        return None
+    try:
+        content_type, content_string = contents.split(',')
+        decoded = base64.b64decode(content_string)
+        # Using PIL to handle various image formats correctly
+        img = Image.open(BytesIO(decoded))
+        # Ensure the image is converted to RGB format
+        return np.array(img.convert('RGB'))
+    except Exception as e:
+        print(f"Error processing uploaded file: {e}")
         return None
 
 def process_image(img_rgb, threshold, threshold_type_str):
     """
-    Processes the entire image (no ROI) based on threshold and spot type, 
+    Processes the entire image based on threshold and spot type, 
     finds spots, marks them, and calculates density statistics.
-    
-    Args:
-        img_rgb (np.array): The full original image array (RGB).
-        threshold (int): The binary threshold value (0-255).
-        threshold_type_str (str): 'bright_spots' or 'dark_spots'
-        
-    Returns:
-        tuple: (processed_figure, num_spots, total_area, total_white_area, ratio_white_to_total)
     """
     if img_rgb is None:
         return go.Figure(), 0, 0, 0, 0.0
@@ -58,7 +74,7 @@ def process_image(img_rgb, threshold, threshold_type_str):
     H, W = img_rgb.shape[:2]
     total_area = H * W
     
-    # --- 2.1 Convert to Greyscale (Step 2) ---
+    # --- 2.1 Convert to Greyscale ---
     img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
     img_bgr_copy = img_bgr.copy()
     
@@ -109,23 +125,50 @@ def process_image(img_rgb, threshold, threshold_type_str):
 
 # --- 3. Dash Layout ---
 
+# Scan for images once at startup to populate the initial dropdown
+available_images = get_local_images()
+initial_value = available_images[0] if available_images else None
+
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col(html.H1("Full Image Spot Density Analyzer", className="text-center text-primary my-4"), width=12)
     ]),
 
-    # --- File Input Row ---
+    # --- File Input Row (Dropdown AND Upload) ---
     dbc.Row([
-        dbc.Col(html.H5("Image Filename (must be in the same folder):", className="mt-3"), width=3),
-        dbc.Col(dcc.Input(
-            id='filename-input',
-            type='text',
-            placeholder='e.g., my_grid.jpg',
-            value='my_image.jpg', # Example placeholder value
-            style={'width': '100%'}
-        ), width=5),
+        # LEFT: Dropdown for local files
+        dbc.Col([
+            html.H5("Select Local JPG/JPEG File:", className="mt-3"),
+            dcc.Dropdown(
+                id='image-dropdown',
+                options=[{'label': f, 'value': f} for f in available_images],
+                placeholder='Select a file from the folder...',
+                value=initial_value,
+                style={'width': '100%'}
+            ),
+        ], width=4),
+
+        # MIDDLE: Upload component for any file
+        dbc.Col([
+            html.H5("OR Upload Any Image File:", className="mt-3"),
+            dcc.Upload(
+                id='upload-image',
+                children=html.Div(['Drag and Drop or ', html.A('Select a File')]),
+                style={
+                    'width': '100%', 'height': '40px', 'lineHeight': '40px',
+                    'borderWidth': '1px', 'borderStyle': 'dashed',
+                    'borderRadius': '5px', 'textAlign': 'center'
+                },
+                multiple=False
+            ),
+        ], width=4),
+
         dbc.Col(html.Div(id='file-status-message', className="font-weight-bold pt-2"), width=4)
     ], className="mb-4 align-items-center"),
+    
+    # Hidden storage for uploaded image data (base64 string)
+    html.Div(id='uploaded-image-data', style={'display': 'none'}),
+
 
     # --- Controls Row: Threshold Type and Value ---
     dbc.Row([
@@ -176,7 +219,7 @@ app.layout = dbc.Container([
     ], className="mb-4"),
 
     dbc.Row([
-        dbc.Col(html.P("Instructions: 1. Ensure your image file (e.g., 'grid.jpg') is in the same folder as this script. 2. Enter the filename above. 3. Select Bright/Dark spots. 4. Adjust the threshold slider to correctly isolate the features (which should turn white in the binary step). 5. The analyzed image will show green outlines on detected spots.", className="text-center text-muted"), width=12)
+        dbc.Col(html.P("Instructions: Select a local file from the dropdown OR upload a file. Use the threshold controls to correctly isolate the features. The green outlines indicate detected spots.", className="text-center text-muted"), width=12)
     ])
 
 ], fluid=True)
@@ -184,7 +227,19 @@ app.layout = dbc.Container([
 
 # --- 4. Callbacks ---
 
-# Callback 1: Update Threshold Display
+# Callback A: Store uploaded file contents in a hidden div
+@app.callback(
+    Output('uploaded-image-data', 'children'),
+    Input('upload-image', 'contents'),
+)
+def store_uploaded_image(contents):
+    """Stores the base64 string of the uploaded image."""
+    if contents:
+        # Stores the raw base64 string provided by dcc.Upload
+        return contents
+    return None
+
+# Callback B: Update Threshold Display
 @app.callback(
     Output('threshold-output', 'children'),
     Input('threshold-slider', 'value')
@@ -192,7 +247,7 @@ app.layout = dbc.Container([
 def update_threshold_output(value):
     return f"{value}"
 
-# Callback 2: Main Analysis Logic
+# Callback C: Main Analysis Logic (Reacts to Upload or Dropdown)
 @app.callback(
     Output('processed-image-graph', 'figure'),
     Output('stats-num-spots', 'children'),
@@ -201,31 +256,43 @@ def update_threshold_output(value):
     Output('stats-ratio', 'children'),
     Output('file-status-message', 'children'),
     
-    Input('filename-input', 'value'),
+    # Inputs:
+    Input('image-dropdown', 'value'),         # For local files
+    Input('uploaded-image-data', 'children'), # For uploaded files (takes priority)
     Input('threshold-slider', 'value'),
     Input('threshold-type', 'value'),
 )
-def update_analysis(filename, threshold, threshold_type):
+def update_analysis(filename_dropdown, uploaded_base64_data, threshold, threshold_type):
     
-    # 1. Load Image
-    img_rgb = load_image_from_file(filename)
+    img_rgb = None
+    source_name = "None"
     
-    # Handle image load failure
+    # --- 1. Determine Source and Load Image ---
+    if uploaded_base64_data:
+        # Source 1: Uploaded image (highest priority)
+        img_rgb = parse_uploaded_contents(uploaded_base64_data)
+        source_name = "Uploaded Image"
+    elif filename_dropdown:
+        # Source 2: Local file selected via dropdown
+        img_rgb = load_image_from_file(filename_dropdown)
+        source_name = f"Local File: {filename_dropdown}"
+    
+    # --- 2. Handle No Image or Load Failure ---
     if img_rgb is None:
-        default_fig = go.Figure().update_layout(title=f"Awaiting image file: {filename}", height=500)
-        status_msg = html.Div(f"Error: File '{filename}' not found or could not be loaded. Check filename and folder.", className="text-danger")
+        default_fig = go.Figure().update_layout(title="No image loaded. Select a file or upload one.", height=500)
+        status_msg = html.Div(f"No image available from source: {source_name}. Please load a valid file.", className="text-warning")
         return (default_fig, html.H5("Spots Detected: 0"), 
                 html.Div("Total Area: 0 pixels"), html.Div("Thresholded Area: 0 pixels"), 
                 html.Div("Ratio (White/Total): 0.0000%"), status_msg)
 
     # Status update for successful load
-    status_msg = html.Div(f"File loaded successfully: {filename}", className="text-success")
+    status_msg = html.Div(f"Image loaded successfully from: {source_name}", className="text-success")
 
-    # 2. Process and Get Results
+    # --- 3. Process and Get Results ---
     fig_processed, num_spots, total_area, total_white_area, ratio_white_to_total = \
         process_image(img_rgb, threshold, threshold_type)
 
-    # 3. Format Stats Output
+    # --- 4. Format Stats Output ---
     stats_num_spots = html.H5(f"Spots Detected: {num_spots}")
     stats_total_area = html.Div(f"Total Image Area: {total_area:,} pixels")
     stats_white_area = html.Div(f"Thresholded White Area: {total_white_area:,} pixels")

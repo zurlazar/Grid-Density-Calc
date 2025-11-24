@@ -134,6 +134,13 @@ app.layout = dbc.Container([
         dbc.Col(html.H1("Full Image Spot Density Analyzer", className="text-center text-primary my-4"), width=12)
     ]),
 
+    # --- Signature Row (Moved to Top) ---
+    dbc.Row([
+        dbc.Col(html.P("Made by Zur Lazar, Nov 24th, 2025", 
+                       className="text-center text-secondary small mb-4"), 
+                width=12)
+    ]),
+
     # --- File Input Row (Dropdown AND Upload) ---
     dbc.Row([
         # LEFT: Dropdown for local files
@@ -220,7 +227,9 @@ app.layout = dbc.Container([
 
     dbc.Row([
         dbc.Col(html.P("Instructions: Select a local file from the dropdown OR upload a file. Use the threshold controls to correctly isolate the features. The green outlines indicate detected spots.", className="text-center text-muted"), width=12)
-    ])
+    ]),
+
+    # The signature row has been moved up, leaving the final row clean.
 
 ], fluid=True)
 

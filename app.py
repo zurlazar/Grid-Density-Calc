@@ -312,3 +312,4 @@ def update_analysis(filename_dropdown, uploaded_base64_data, threshold, threshol
 # Standard practice to run the app locally if executed directly
 if __name__ == '__main__':
     app.run(debug=True)
+

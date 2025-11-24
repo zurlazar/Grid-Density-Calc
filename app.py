@@ -1,155 +1,149 @@
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import numpy as np
-import base64
-import io
-from PIL import Image
 import cv2
 import math
+import os
 
 # --- 1. Global Initialization for Dash and Gunicorn ---
-# These must be defined globally for Gunicorn to find the WSGI application object.
-# Use a modern, responsive theme like CERULEAN
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CERULEAN])
-server = app.server # This is the WSGI object Gunicorn needs to serve the app
+server = app.server
 
 # --- 2. Data and Helper Functions ---
 
-def parse_contents(contents, filename):
+def load_image_from_file(filename):
     """
-    Decodes the base64 content from the Dash Upload component into a NumPy array
-    (OpenCV BGR format).
+    Loads an image directly from the local filesystem (must be in the same 
+    folder as app.py) into an RGB numpy array.
+    Returns RGB numpy array or None on failure.
     """
-    if contents is None:
+    if not filename:
         return None
     
+    # In a local environment, this looks for the file in the script's directory.
+    # In the canvas environment, it looks relative to the execution context.
     try:
-        # Get content type and base64 string
-        content_type, content_string = contents.split(',')
-        decoded = base64.b64decode(content_string)
-        
-        # Open image using PIL
-        image_stream = io.BytesIO(decoded)
-        pil_img = Image.open(image_stream).convert('RGB')
-        
-        # Convert PIL image to NumPy array (BGR format for OpenCV)
-        img_rgb = np.array(pil_img)
+        # Read the image using OpenCV (loads as BGR)
+        img_bgr = cv2.imread(filename)
+        if img_bgr is None:
+            return None
+            
+        # Convert BGR to RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         return img_rgb
         
     except Exception as e:
-        print(f"Error parsing image contents: {e}")
+        print(f"Error loading image '{filename}': {e}")
         return None
 
-def process_image_roi(img_rgb, roi_data, threshold):
+def process_image(img_rgb, threshold, threshold_type_str):
     """
-    Processes the image within the specified ROI, finds spots, and calculates density statistics.
+    Processes the entire image (no ROI) based on threshold and spot type, 
+    finds spots, marks them, and calculates density statistics.
     
     Args:
         img_rgb (np.array): The full original image array (RGB).
-        roi_data (dict or None): Dictionary containing the ROI ranges, or None for full image.
         threshold (int): The binary threshold value (0-255).
+        threshold_type_str (str): 'bright_spots' or 'dark_spots'
         
     Returns:
-        tuple: (processed_figure, num_spots, total_roi_area, total_white_area, ratio_white_to_total)
+        tuple: (processed_figure, num_spots, total_area, total_white_area, ratio_white_to_total)
     """
     if img_rgb is None:
         return go.Figure(), 0, 0, 0, 0.0
 
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    
     H, W = img_rgb.shape[:2]
+    total_area = H * W
     
-    # --- 2.1 Determine Coordinates ---
-    if roi_data and 'range' in roi_data and 'xaxis.range' in roi_data['range'] and 'yaxis.range' in roi_data['range']:
-        x_range = roi_data['range']['xaxis.range']
-        y_range = roi_data['range']['yaxis.range']
-        
-        # Coordinates must be integers and within bounds
-        # Note: Plotly's image layout inverts Y axis, so y0 is max and y1 is min visually.
-        x0 = max(0, int(math.floor(min(x_range))))
-        x1 = min(W, int(math.ceil(max(x_range))))
-        y0 = max(0, int(math.floor(min(y_range))))
-        y1 = min(H, int(math.ceil(max(y_range))))
-        
+    # --- 2.1 Convert to Greyscale (Step 2) ---
+    img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    img_bgr_copy = img_bgr.copy()
+    
+    # --- Determine Thresholding Mode ---
+    if threshold_type_str == 'bright_spots':
+        # THRESH_BINARY: Pixels > threshold become white (255) -> Detects bright spots
+        t_type = cv2.THRESH_BINARY
     else:
-        # Full Image
-        x0, x1 = 0, W
-        y0, y1 = 0, H
-
-    # Ensure valid range
-    if x1 <= x0 or y1 <= y0:
-        return go.Figure(), 0, 0, 0, 0.0
-    
-    # --- 2.2 Slice and Process ROI ---
-    roi_gray = cv2.cvtColor(img_rgb[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
-    roi_bgr = img_bgr[y0:y1, x0:x1].copy()
-    roi_height, roi_width = roi_gray.shape[:2]
-    
-    total_roi_area = roi_height * roi_width
-    
-    # Binarize ROI
-    _, binary_roi = cv2.threshold(roi_gray, threshold, 255, cv2.THRESH_BINARY_INV)
+        # THRESH_BINARY_INV: Pixels <= threshold become white (255) -> Detects dark spots
+        t_type = cv2.THRESH_BINARY_INV
+        
+    # --- Binarize Image (Step 3) ---
+    _, binary_img = cv2.threshold(img_gray, threshold, 255, t_type)
     
     # Calculate white pixel area
-    total_white_area = np.sum(binary_roi == 255)
+    total_white_area = np.sum(binary_img == 255)
     
     # Calculate ratio
-    ratio_white_to_total = total_white_area / total_roi_area if total_roi_area > 0 else 0.0
+    ratio_white_to_total = total_white_area / total_area if total_area > 0 else 0.0
     
-    # Find Contours in ROI for spot detection
-    contours, _ = cv2.findContours(binary_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    num_spots = len(contours)
+    # --- Find Contours (Spots) ---
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Draw contours on the BGR ROI for display
-    cv2.drawContours(roi_bgr, contours, -1, (0, 255, 0), 2)
+    # Filter contours to exclude small noise (e.g., minimum area of 5 pixels)
+    valid_contours = [c for c in contours if cv2.contourArea(c) > 5]
+    num_spots = len(valid_contours)
+    
+    # --- Draw Contours (Step 4: Green marks on analyzed image) ---
+    cv2.drawContours(img_bgr_copy, valid_contours, -1, (0, 255, 0), 2) # Green contours
     
     # Convert back to RGB for Plotly figure
-    roi_rgb_marked = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+    img_rgb_marked = cv2.cvtColor(img_bgr_copy, cv2.COLOR_BGR2RGB)
     
-    # --- 2.3 Create Processed Figure (Only shows the ROI) ---
-    fig_processed = go.Figure(go.Image(z=roi_rgb_marked))
+    # --- Create Processed Figure ---
+    fig_processed = go.Figure(go.Image(z=img_rgb_marked))
     fig_processed.update_layout(
-        title=f"Processed Grid (ROI: {roi_width}x{roi_height})",
-        xaxis_title="X (ROI)", yaxis_title="Y (ROI)",
+        title=f"Analyzed Image (W:{W} x H:{H}) - Spots Counted: {num_spots}",
+        xaxis_title="X Coordinate", yaxis_title="Y Coordinate",
         margin=dict(l=10, r=10, t=50, b=10),
-        xaxis_range=[0, roi_width],
-        yaxis_range=[roi_height, 0], # Invert Y-axis for image convention
+        xaxis_range=[0, W],
+        yaxis_range=[H, 0], # Invert Y axis for standard image display
     )
     fig_processed.update_xaxes(showgrid=False, zeroline=False, showticklabels=True)
     fig_processed.update_yaxes(showgrid=False, zeroline=False, showticklabels=True)
 
-    return fig_processed, num_spots, total_roi_area, total_white_area, ratio_white_to_total
+    return fig_processed, num_spots, total_area, total_white_area, ratio_white_to_total
 
 
 # --- 3. Dash Layout ---
 
 app.layout = dbc.Container([
-    # Hidden component to store the image data (base64 string)
-    dcc.Store(id='uploaded-image-data'),
-
     dbc.Row([
-        dbc.Col(html.H1("Grid Density and Spot Calculator", className="text-center text-primary my-4"), width=12)
+        dbc.Col(html.H1("Full Image Spot Density Analyzer", className="text-center text-primary my-4"), width=12)
     ]),
 
+    # --- File Input Row ---
     dbc.Row([
-        dbc.Col(dcc.Upload(
-            id='upload-image',
-            children=html.Div(['Drag and Drop or ', html.A('Select a File')]),
-            style={
-                'width': '100%', 'height': '60px', 'lineHeight': '60px',
-                'borderWidth': '1px', 'borderStyle': 'dashed', 'borderRadius': '5px',
-                'textAlign': 'center', 'margin': '10px'
-            },
-            multiple=False
-        ), width=12)
-    ]),
+        dbc.Col(html.H5("Image Filename (must be in the same folder):", className="mt-3"), width=3),
+        dbc.Col(dcc.Input(
+            id='filename-input',
+            type='text',
+            placeholder='e.g., my_grid.jpg',
+            value='my_image.jpg', # Example placeholder value
+            style={'width': '100%'}
+        ), width=5),
+        dbc.Col(html.Div(id='file-status-message', className="font-weight-bold pt-2"), width=4)
+    ], className="mb-4 align-items-center"),
 
-    # --- Threshold Control Row ---
+    # --- Controls Row: Threshold Type and Value ---
     dbc.Row([
-        dbc.Col(html.Div(id='output-image-upload'), width=12, className="text-center mb-3"),
-        dbc.Col(html.H5("Threshold Value (for Binarization):", className="mt-3"), width=12),
+        # Threshold Type Selector
+        dbc.Col(html.H5("Spot Detection Type:", className="mt-3"), width=4),
+        dbc.Col(dcc.RadioItems(
+            id='threshold-type',
+            options=[
+                {'label': ' Bright Spots (on Dark Background) -> White Binary', 'value': 'bright_spots'},
+                {'label': ' Dark Spots (on Bright Background) -> White Binary', 'value': 'dark_spots'}
+            ],
+            value='bright_spots',
+            inline=True,
+            className="mt-3"
+        ), width=8),
+
+        # Threshold Value Slider
+        dbc.Col(html.H5("Threshold Value (0-255):", className="mt-3"), width=12),
         dbc.Col(dcc.Slider(
             id='threshold-slider',
             min=0, max=255, step=1, value=127,
@@ -158,38 +152,31 @@ app.layout = dbc.Container([
         dbc.Col(html.Div(id='threshold-output', className="font-weight-bold pt-2"), width=2)
     ], className="mb-4 align-items-center"),
 
-    # --- Main Display Row (Adjusted for visual focus) ---
+    # --- Main Display and Stats Row ---
     dbc.Row([
-        # LEFT: Original Image with ROI selector (Smaller: width=6)
-        dbc.Col(dcc.Graph(id='main-image-graph', config={'scrollZoom': True}), width=6),
-        
-        # RIGHT: Analysis/Stats/Processed ROI (Larger focus: width=6)
+        # LEFT: Analysis Stats
         dbc.Col([
-            # Stats Card
             dbc.Card(
                 dbc.CardBody([
-                    html.H4("Analysis Results (Live ROI)", className="card-title text-success"),
-                    html.Div(id='roi-info-text', className="mb-2 text-muted"),
+                    html.H4("Analysis Results (Full Image)", className="card-title text-success"),
                     html.Div(id='stats-num-spots', className="h5"),
                     html.Div(id='stats-total-area'),
                     html.Div(id='stats-white-area'),
-                    html.Div(id='stats-ratio'),
+                    html.Div(id='stats-ratio', className="h4 text-danger mt-2"),
                 ]),
                 className="mb-4 shadow-sm"
-            ),
-            
-            # Processed ROI Figure Card (Increased height for larger view)
-            dbc.Card(
-                dbc.CardBody([
-                    html.H4("Processed ROI View", className="card-title"),
-                    dcc.Graph(id='processed-roi-graph', style={'height': '550px'}) 
-                ], className="p-2") # Reduced padding inside card body for graph space
             )
-        ], width=6),
+        ], width=4),
+        
+        # RIGHT: Processed Image Figure
+        dbc.Col(
+            dcc.Graph(id='processed-image-graph', style={'height': '70vh', 'min-height': '500px'}),
+            width=8
+        )
     ], className="mb-4"),
 
     dbc.Row([
-        dbc.Col(html.P("Instructions: 1. Upload an image. 2. Adjust the threshold. 3. Click and drag on the full image to select a Region of Interest (ROI). 4. Statistics update live for the selected ROI.", className="text-center text-muted"), width=12)
+        dbc.Col(html.P("Instructions: 1. Ensure your image file (e.g., 'grid.jpg') is in the same folder as this script. 2. Enter the filename above. 3. Select Bright/Dark spots. 4. Adjust the threshold slider to correctly isolate the features (which should turn white in the binary step). 5. The analyzed image will show green outlines on detected spots.", className="text-center text-muted"), width=12)
     ])
 
 ], fluid=True)
@@ -197,19 +184,7 @@ app.layout = dbc.Container([
 
 # --- 4. Callbacks ---
 
-# Callback 1: Upload and Store Image Data
-@app.callback(
-    Output('uploaded-image-data', 'children'),
-    Output('output-image-upload', 'children'),
-    Input('upload-image', 'contents'),
-    State('upload-image', 'filename')
-)
-def store_data(contents, filename):
-    if contents is not None:
-        return contents, html.Div(f'File uploaded: {filename}', className="text-success")
-    return dash.no_update, html.Div("Awaiting image upload...", className="text-warning")
-
-# Callback 2: Update Threshold Display
+# Callback 1: Update Threshold Display
 @app.callback(
     Output('threshold-output', 'children'),
     Input('threshold-slider', 'value')
@@ -217,112 +192,47 @@ def store_data(contents, filename):
 def update_threshold_output(value):
     return f"{value}"
 
-# Callback 3: Main Analysis and Figure Updates (The Core Logic)
+# Callback 2: Main Analysis Logic
 @app.callback(
-    Output('main-image-graph', 'figure'),
-    Output('processed-roi-graph', 'figure'),
+    Output('processed-image-graph', 'figure'),
     Output('stats-num-spots', 'children'),
     Output('stats-total-area', 'children'),
     Output('stats-white-area', 'children'),
     Output('stats-ratio', 'children'),
-    Output('roi-info-text', 'children'),
+    Output('file-status-message', 'children'),
     
-    Input('uploaded-image-data', 'children'),
+    Input('filename-input', 'value'),
     Input('threshold-slider', 'value'),
-    Input('main-image-graph', 'relayoutData') # Input for ROI data
+    Input('threshold-type', 'value'),
 )
-def update_analysis(img_base64, threshold, relayoutData):
+def update_analysis(filename, threshold, threshold_type):
     
-    if img_base64 is None:
-        # Initial state or no image loaded
-        default_fig = go.Figure().update_layout(title="Image Display Area")
-        return (default_fig, default_fig, "Spots Detected: 0", 
-                "ROI Area: 0 pixels", "White Area: 0 pixels", 
-                "Ratio: 0.0000%", "Please load an image to begin.")
-
-    img_rgb = parse_contents(img_base64, "temp")
+    # 1. Load Image
+    img_rgb = load_image_from_file(filename)
     
+    # Handle image load failure
     if img_rgb is None:
-        # Error during parsing
-        error_fig = go.Figure().update_layout(title="Error: Could not load image")
-        return (error_fig, error_fig, "Spots Detected: 0", 
-                "ROI Area: 0 pixels", "White Area: 0 pixels", 
-                "Ratio: 0.0000%", "Could not process image data.")
+        default_fig = go.Figure().update_layout(title=f"Awaiting image file: {filename}", height=500)
+        status_msg = html.Div(f"Error: File '{filename}' not found or could not be loaded. Check filename and folder.", className="text-danger")
+        return (default_fig, html.H5("Spots Detected: 0"), 
+                html.Div("Total Area: 0 pixels"), html.Div("Thresholded Area: 0 pixels"), 
+                html.Div("Ratio (White/Total): 0.0000%"), status_msg)
 
-    H, W = img_rgb.shape[:2]
+    # Status update for successful load
+    status_msg = html.Div(f"File loaded successfully: {filename}", className="text-success")
 
-    # --- 1. Determine ROI (Robust Key Handling) ---
-    roi_data = None
-    roi_info_text = "ROI: Full Image (Select by clicking and dragging)"
-    x_range, y_range = None, None
-    
-    # Check for a specific BOX SELECTION or ZOOM/PAN event
-    if relayoutData:
-        # Check for the range keys which are reliably present during box selection/zoom events
-        if 'xaxis.range' in relayoutData and 'yaxis.range' in relayoutData:
-            x_range = relayoutData['xaxis.range']
-            y_range = relayoutData['yaxis.range']
+    # 2. Process and Get Results
+    fig_processed, num_spots, total_area, total_white_area, ratio_white_to_total = \
+        process_image(img_rgb, threshold, threshold_type)
 
-        # NOTE: Keys like 'xaxis.range[0]' are typically only present during pan/zoom 
-        # but not always with the full range definition, leading to KeyError.
-        # Focusing on 'xaxis.range' is more robust for range extraction.
-
-    # If x_range and y_range were successfully extracted, set the ROI data
-    if x_range and y_range:
-        # Pass the extracted ranges to the processing function
-        roi_data = {'range': {'xaxis.range': x_range, 'yaxis.range': y_range}}
-        
-        # Display info: Note that in Plotly's image layout, y-axis is inverted
-        x_min_display = int(min(x_range))
-        x_max_display = int(max(x_range))
-        y_min_display = int(min(y_range))
-        y_max_display = int(max(y_range))
-        
-        # Display Y range from top (max value) to bottom (min value) for visual consistency
-        roi_info_text = f"ROI: X[{x_min_display:,}:{x_max_display:,}], Y[{y_max_display:,}:{y_min_display:,}]"
-
-
-    # --- 2. Process and Get Results ---
-    # Pass the image and the potentially defined roi_data to the processor
-    fig_processed, num_spots, total_roi_area, total_white_area, ratio_white_to_total = \
-        process_image_roi(img_rgb, roi_data, threshold)
-
-    # --- 3. Update Main Image Figure (Include ROI Marker) ---
-    fig_main = go.Figure(go.Image(z=img_rgb))
-    fig_main.update_layout(
-        title="Full Image (Select ROI by clicking and dragging)",
-        xaxis_title="X Coordinate", yaxis_title="Y Coordinate",
-        dragmode='select', # Enables box selection
-        modebar_activecolor='red',
-        xaxis_range=[0, W],
-        yaxis_range=[H, 0], # Invert Y-axis
-        margin=dict(l=10, r=10, t=50, b=10),
-    )
-    fig_main.update_xaxes(showgrid=False, zeroline=False, showticklabels=True)
-    fig_main.update_yaxes(showgrid=False, zeroline=False, showticklabels=True)
-    
-    # Draw the selected ROI box on the main figure for visual confirmation
-    if x_range and y_range:
-        fig_main.add_shape(
-            type="rect",
-            xref="x", yref="y",
-            x0=x_range[0], y0=y_range[1], x1=x_range[1], y1=y_range[0], # y-coords are swapped due to inversion
-            line=dict(color="Red", width=3),
-            opacity=0.5
-        )
-
-
-    # --- 4. Format Stats Output ---
+    # 3. Format Stats Output
     stats_num_spots = html.H5(f"Spots Detected: {num_spots}")
-    stats_total_area = html.Div(f"ROI Area: {total_roi_area:,} pixels")
-    stats_white_area = html.Div(f"White Area: {total_white_area:,} pixels")
-    stats_ratio = html.Div([
-        "Ratio (White/Total): ", 
-        html.B(f"{ratio_white_to_total*100:.4f}%", className="text-danger")
-    ])
+    stats_total_area = html.Div(f"Total Image Area: {total_area:,} pixels")
+    stats_white_area = html.Div(f"Thresholded White Area: {total_white_area:,} pixels")
+    stats_ratio = html.Div(f"Ratio (White/Total): {ratio_white_to_total*100:.4f}%")
     
-    return fig_main, fig_processed, stats_num_spots, stats_total_area, stats_white_area, stats_ratio, roi_info_text
+    return fig_processed, stats_num_spots, stats_total_area, stats_white_area, stats_ratio, status_msg
 
 # Standard practice to run the app locally if executed directly
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run(debug=True)

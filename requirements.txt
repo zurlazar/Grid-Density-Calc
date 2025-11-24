@@ -1,0 +1,14 @@
+# Core Dash and Plotly
+plotly
+dash>=2.0.0
+dash-core-components
+dash-html-components
+dash-bootstrap-components
+
+# Image Processing
+opencv-python-headless  # Use headless for server deployment
+numpy
+
+# Server/Deployment
+gunicorn
+Pillow
